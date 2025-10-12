@@ -1,0 +1,4 @@
+# Add this to your requirements.txt or install directly
+python-decouple==3.8
+pycryptodome==3.19.0
+requests==2.31.0
