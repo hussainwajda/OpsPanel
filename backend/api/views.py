@@ -3,6 +3,7 @@ from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from rest_framework.authtoken.models import Token
 from django.contrib.auth import login
 from django.utils import timezone
@@ -19,6 +20,14 @@ from .serializers import (
     UserValidationSerializer,
     UserSerializer
 )
+from .utils import (
+    decrypt_ssh_password,
+    create_ssh_config,
+    get_ssh_connection,
+    cleanup_ssh_connections,
+    get_connection_key
+)
+import paramiko
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +286,86 @@ def get_all_users_view(request):
             'message': 'Error retrieving users',
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class ConnectAPIView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = [CsrfExemptSessionAuthentication]
+
+    def post(self, request, *args, **kwargs):
+        start_time = timezone.now()
+        username = request.data.get('username')
+        ip_address = request.data.get('ipAddress')
+        auth_method = request.data.get('authMethod')
+        password = request.data.get('password')
+        key_file_content = request.data.get('keyFileContent')
+        key_file_name = request.data.get('keyFileName')
+
+        if not all([username, ip_address, auth_method]):
+            return Response({
+                'success': False,
+                'message': 'Missing SSH connection details'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if auth_method not in ['password', 'key']:
+            return Response({
+                'success': False,
+                'message': 'Invalid authentication method'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if auth_method == 'password' and not password:
+            return Response({
+                'success': False,
+                'message': 'Password is required for password authentication'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if auth_method == 'key' and not key_file_content:
+            return Response({
+                'success': False,
+                'message': 'Key file content is required for key authentication'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        decrypted_password = None
+        decrypted_key_content = None
+
+        if auth_method == 'password':
+            decrypted_password = decrypt_ssh_password(password)
+            if not decrypted_password:
+                return Response({'success': False, 'message': 'Failed to decrypt SSH password'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            decrypted_key_content = decrypt_ssh_password(key_file_content)
+            if not decrypted_key_content:
+                return Response({'success': False, 'message': 'Failed to decrypt SSH key file'}, status=status.HTTP_400_BAD_REQUEST)
+
+        connection_config = create_ssh_config(
+            username, ip_address, auth_method, decrypted_password, decrypted_key_content, key_file_name
+        )
+
+        conn = None
+        try:
+            conn = get_ssh_connection(connection_config)
+            
+            os_type_command = "cat /etc/os-release 2>/dev/null | grep -E '^ID=' | cut -d'=' -f2 | tr -d '\"'"
+            stdin, stdout, stderr = conn.exec_command(os_type_command)
+            os_type = stdout.read().decode().strip()
+            
+            logger.info(f"SSH connect completed in {(timezone.now() - start_time).total_seconds()}s")
+            
+            return Response({
+                'success': True,
+                'osType': os_type
+            }, status=status.HTTP_200_OK)
+
+        except paramiko.AuthenticationException:
+            return Response({'success': False, 'message': 'Authentication failed. Please check your credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+        except paramiko.SSHException as e:
+            return Response({'success': False, 'message': f'SSH connection error: {e}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            logger.error(f"SSH connect error after {(timezone.now() - start_time).total_seconds()}s: {e}")
+            return Response({'success': False, 'message': 'Failed to connect to server', 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        finally:
+            # The connection is kept in the pool, so we don't close it here.
+            # cleanup_ssh_connections() will handle idle connections.
+            pass
 
 @api_view(['DELETE'])
 @permission_classes([AllowAny])
