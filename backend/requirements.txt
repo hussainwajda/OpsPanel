@@ -1,4 +1,7 @@
-# Add this to your requirements.txt or install directly
+Django==5.2.6
+djangorestframework==3.16.1
+django-cors-headers==4.9.0
 python-decouple==3.8
-pycryptodome==3.19.0
-requests==2.31.0
+python-dotenv==1.1.1
+pycryptodome==3.23.0
+paramiko==4.0.0
