@@ -17,4 +17,11 @@ urlpatterns = [
 
     # SSH connection endpoint
     re_path(r'^connect/?$', views.ConnectAPIView.as_view(), name='connect'),
+    
+    # Application installation endpoints
+    path('check-installed', views.check_installed_view, name='check_installed'),
+    path('install', views.install_view, name='install'),
+
+    # Verify SSH connection
+    path('verify-connection', views.verify_connection_view, name='verify_connection'),
 ]
