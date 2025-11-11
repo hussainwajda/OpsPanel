@@ -1,38 +1,76 @@
 import os
 from django.conf import settings
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
 import base64
 import hashlib
+import paramiko
+import time
+from io import StringIO
+
+ssh_connection_pool = {}
 
 def decrypt_aes_data(encrypted_data, secret_key=None):
     """
-    Decrypt AES encrypted data
-    Based on Node.js backend decryptAESData function
+    Decrypts data encrypted by CryptoJS.AES.encrypt()
     """
-    if not encrypted_data or not secret_key:
+    if not encrypted_data:
+        print("Decryption error: No encrypted data provided.")
         return None
+    if not secret_key:
+        print("Decryption error: No secret key provided.")
+        return None
+
+    print(f"Attempting to decrypt data starting with: {encrypted_data[:20]}...")
     
     try:
-        # Decode base64
-        encrypted_bytes = base64.b64decode(encrypted_data)
+        # Base64 decode the encrypted data
+        encrypted_data_bytes = base64.b64decode(encrypted_data)
+        print("Base64 decoding successful.")
+
+        # Check for and extract the salt
+        if encrypted_data_bytes.startswith(b'Salted__'):
+            salt = encrypted_data_bytes[8:16]
+            ciphertext = encrypted_data_bytes[16:]
+            print(f"Salt found: {salt.hex()}")
+        else:
+            salt = b''
+            ciphertext = encrypted_data_bytes
+            print("No salt found.")
+
+        # Derive the key and IV from the secret key and salt
+        key_iv = b''
+        temp = b''
+        while len(key_iv) < 48:  # 32 bytes for key + 16 bytes for IV
+            temp = hashlib.md5(temp + secret_key.encode('utf-8') + salt).digest()
+            key_iv += temp
         
-        # Extract IV and ciphertext
-        iv = encrypted_bytes[:16]
-        ciphertext = encrypted_bytes[16:]
+        key = key_iv[:32]
+        iv = key_iv[32:48]
+        print("Key and IV derived successfully.")
+
+        # Decrypt the ciphertext
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        decrypted_padded = cipher.decrypt(ciphertext)
+        print("AES decryption successful.")
+
+        # Unpad the decrypted data
+        padding_len = decrypted_padded[-1]
+        if padding_len > AES.block_size or padding_len == 0:
+            print(f"Decryption error: Invalid padding length ({padding_len}). This almost always means the secret key is incorrect.")
+            return None
         
-        # Create cipher
-        cipher = AES.new(secret_key.encode('utf-8')[:32].ljust(32, b'0'), AES.MODE_CBC, iv)
-        
-        # Decrypt
-        decrypted_bytes = cipher.decrypt(ciphertext)
-        
-        # Remove padding
-        decrypted_data = unpad(decrypted_bytes, AES.block_size)
-        
-        return decrypted_data.decode('utf-8')
+        decrypted = decrypted_padded[:-padding_len]
+        print("Unpadding successful.")
+
+        decoded_string = decrypted.decode('utf-8')
+        print("UTF-8 decoding successful.")
+        return decoded_string
+
+    except (ValueError, IndexError) as e:
+        print(f'Decryption error during processing (e.g., padding, base64): {e}. This often points to an incorrect secret key or corrupted data.')
+        return None
     except Exception as e:
-        print(f'Decryption error: {e}')
+        print(f'An unexpected decryption error occurred: {e}')
         return None
 
 def decrypt_ssh_password(encrypted_password):
@@ -45,7 +83,7 @@ def decrypt_ssh_password(encrypted_password):
     
     try:
         # Use SSH_PASSWORD_KEY from settings
-        secret_key = getattr(settings, 'SSH_PASSWORD_KEY', 'default-ssh-key')
+        secret_key = os.environ.get('SSH_PASSWORD_KEY')
         return decrypt_aes_data(encrypted_password, secret_key)
     except Exception as e:
         print(f'SSH password decryption error: {e}')
@@ -73,3 +111,162 @@ def verify_password(password, hashed_password):
     from django.contrib.auth.hashers import check_password
     return check_password(password, hashed_password)
 
+def get_connection_key(username, ip_address, auth_method):
+    return f"{username}@{ip_address}-{auth_method}"
+
+def create_ssh_config(username, ip_address, auth_method, decrypted_password=None, decrypted_key_content=None, key_file_name=None):
+    config = {
+        'hostname': ip_address,
+        'port': 22,
+        'username': username,
+        'timeout': 20,
+        'auth_timeout': 20,
+    }
+    if auth_method == 'password':
+        config['password'] = decrypted_password
+    else:
+        key_obj = StringIO(decrypted_key_content)
+        pkey = None
+        # List of key classes to try, in a common order of preference.
+        key_classes = [paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey]
+        
+        for key_class in key_classes:
+            try:
+                # Rewind the file-like object for each attempt
+                key_obj.seek(0)
+                pkey = key_class.from_private_key(key_obj)
+                # If successful, break the loop
+                break
+            except paramiko.SSHException:
+                # This is expected if the key is not of the current type, so we continue.
+                continue
+            except Exception:
+                # Catch any other unexpected errors and continue to the next key type.
+                continue
+        
+        if pkey is None:
+            # If no key class could parse the key, raise an error.
+            raise paramiko.SSHException("Failed to parse private key. The format is unsupported or the key is corrupted.")
+            
+        config['pkey'] = pkey
+
+    return config
+
+def get_ssh_connection(config):
+    connection_key = get_connection_key(config['username'], config['hostname'], 'password' if 'password' in config else 'key')
+    
+    if connection_key in ssh_connection_pool:
+        existing_conn_info = ssh_connection_pool[connection_key]
+        client = existing_conn_info['client']
+        if client.get_transport() and client.get_transport().is_active():
+            existing_conn_info['last_used'] = time.time()
+            return client
+        else:
+            del ssh_connection_pool[connection_key]
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        client.connect(**config)
+        ssh_connection_pool[connection_key] = {
+            'client': client,
+            'last_used': time.time()
+        }
+        return client
+    except Exception as e:
+        raise e
+
+def cleanup_ssh_connections():
+    now = time.time()
+    closed_count = 0
+    for key, value in list(ssh_connection_pool.items()):
+        if now - value['last_used'] > 5 * 60:
+            try:
+                value['client'].close()
+                closed_count += 1
+            except Exception:
+                pass
+            del ssh_connection_pool[key]
+    if closed_count > 0:
+        print(f"Connection pool cleanup: closed {closed_count} inactive connections")
+
+def execute_ssh_command(client, command, use_sudo=False, decrypted_password=None, auth_method='password', return_code=False, ignore_error=False):
+    """
+    Execute a command via SSH connection
+    Based on Node.js backend createExecPromise function
+    """
+    try:
+        if use_sudo and auth_method == 'password' and decrypted_password:
+            final_command = f'echo "{decrypted_password}" | sudo -S {command}'
+        elif use_sudo and auth_method == 'key':
+            final_command = f'sudo {command}'
+        elif 'sudo' in command and auth_method == 'password' and decrypted_password:
+            final_command = command.replace('sudo', f'echo "{decrypted_password}" | sudo -S')
+        else:
+            final_command = command
+        
+        stdin, stdout, stderr = client.exec_command(final_command)
+        exit_status = stdout.channel.recv_exit_status()
+        output = stdout.read().decode('utf-8')
+        error_output = stderr.read().decode('utf-8')
+        
+        if return_code:
+            return {'output': output, 'code': exit_status}
+        elif exit_status != 0 and not ignore_error:
+            raise Exception(f'Command exited with code {exit_status}: {error_output or "Unknown error"}')
+        else:
+            return output
+    except Exception as e:
+        raise e
+
+def upload_and_execute_script(client, script_content, use_sudo=False, decrypted_password=None, auth_method='password'):
+    """
+    Upload a script to the remote server and execute it
+    Based on Node.js backend execute-script endpoint
+    """
+    import random
+    timestamp = int(time.time() * 1000)
+    script_filename = f'/tmp/custom_script_{timestamp}_{random.randint(1000, 9999)}.sh'
+    
+    try:
+        # Upload script using SFTP
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(script_filename, 'w') as f:
+                f.write(script_content)
+            sftp.chmod(script_filename, 0o755)
+        finally:
+            sftp.close()
+        
+        # Execute the script
+        if use_sudo:
+            if auth_method == 'password' and decrypted_password:
+                command = f'echo "{decrypted_password}" | sudo -S {script_filename}'
+            else:
+                command = f'sudo {script_filename}'
+        else:
+            command = script_filename
+        
+        stdin, stdout, stderr = client.exec_command(command)
+        exit_status = stdout.channel.recv_exit_status()
+        output = stdout.read().decode('utf-8')
+        error_output = stderr.read().decode('utf-8')
+        
+        # Clean up script file
+        try:
+            client.exec_command(f'rm -f {script_filename}')
+        except:
+            pass
+        
+        if exit_status != 0:
+            raise Exception(f'Script execution failed: {error_output or "Unknown error"}')
+        
+        return output
+    except Exception as e:
+        # Try to clean up script file even on error
+        try:
+            client.exec_command(f'rm -f {script_filename}')
+        except:
+            pass
+        raise e

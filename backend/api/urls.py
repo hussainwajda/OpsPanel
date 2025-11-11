@@ -1,4 +1,4 @@
-from django.urls import path
+from django.urls import path, re_path
 from . import views
 
 urlpatterns = [
@@ -14,4 +14,14 @@ urlpatterns = [
     # User management endpoints
     path('users/', views.get_all_users_view, name='get_all_users'),
     path('users/delete/', views.delete_user_view, name='delete_user'),
+
+    # SSH connection endpoint
+    re_path(r'^connect/?$', views.ConnectAPIView.as_view(), name='connect'),
+    
+    # Application installation endpoints
+    path('check-installed', views.check_installed_view, name='check_installed'),
+    path('install', views.install_view, name='install'),
+
+    # Verify SSH connection
+    path('verify-connection', views.verify_connection_view, name='verify_connection'),
 ]
