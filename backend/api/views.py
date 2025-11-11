@@ -1,10 +1,11 @@
 from django.shortcuts import render
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.authtoken.models import Token
+from rest_framework.authentication import TokenAuthentication
 from django.contrib.auth import login
 from django.utils import timezone
 from django.core.cache import cache
@@ -13,7 +14,7 @@ from django.core.exceptions import ValidationError
 import logging
 from django.views.decorators.csrf import csrf_exempt
 from .authentication import CsrfExemptSessionAuthentication
-from .models import CustomUser
+from .models import CustomUser, ServerConnectionHistory
 from .serializers import (
     UserRegistrationSerializer, 
     UserLoginSerializer, 
@@ -27,9 +28,11 @@ from .utils import (
     cleanup_ssh_connections,
     get_connection_key,
     execute_ssh_command,
-    upload_and_execute_script
+    upload_and_execute_script,
+    ssh_connection_pool
 )
 import paramiko
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -291,7 +294,7 @@ def get_all_users_view(request):
 
 class ConnectAPIView(APIView):
     permission_classes = [AllowAny]
-    authentication_classes = [CsrfExemptSessionAuthentication]
+    authentication_classes = [CsrfExemptSessionAuthentication, TokenAuthentication]
 
     def post(self, request, *args, **kwargs):
         start_time = timezone.now()
@@ -351,6 +354,28 @@ class ConnectAPIView(APIView):
             os_type = stdout.read().decode().strip()
             
             logger.info(f"SSH connect completed in {(timezone.now() - start_time).total_seconds()}s")
+            
+            # Save connection history if user is authenticated
+            logger.info(f"User authentication status: is_authenticated={request.user.is_authenticated}, user={request.user if hasattr(request.user, 'username') else 'Anonymous'}")
+            if request.user.is_authenticated:
+                try:
+                    logger.info(f"Attempting to save connection history for authenticated user {request.user.username}")
+                    save_connection_history_internal(
+                        user=request.user,
+                        ip_address=ip_address,
+                        port=22,
+                        username=username,
+                        auth_method=auth_method,
+                        encrypted_password=password if auth_method == 'password' else None,
+                        encrypted_key_content=key_file_content if auth_method == 'key' else None,
+                        key_file_name=key_file_name if auth_method == 'key' else None
+                    )
+                    logger.info(f"Connection history saved successfully for user {request.user.username} - {username}@{ip_address}")
+                except Exception as history_error:
+                    logger.error(f"Failed to save connection history: {str(history_error)}", exc_info=True)
+                    # Don't fail the connection if history save fails
+            else:
+                logger.warning(f"User not authenticated - connection history will not be saved for {username}@{ip_address}")
             
             return Response({
                 'success': True,
@@ -826,3 +851,639 @@ def verify_connection_view(request):
             'message': 'Failed to verify connection to server',
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+def save_connection_history_internal(user, ip_address, port, username, auth_method, encrypted_password=None, encrypted_key_content=None, key_file_name=None):
+    """
+    Internal function to save or update connection history
+    Stores encrypted credentials and updates last_connected timestamp
+    """
+    try:
+        # Check if connection history already exists for this user, IP, and username
+        existing_history = ServerConnectionHistory.objects.filter(
+            user=user,
+            server_ip=ip_address,
+            server_username=username
+        ).first()
+        
+        if existing_history:
+            # Update existing record
+            existing_history.last_connected = timezone.now()
+            existing_history.server_port = port
+            existing_history.server_key_type = auth_method
+            
+            if auth_method == 'password' and encrypted_password:
+                existing_history.server_password = encrypted_password
+                existing_history.server_key = None
+                existing_history.server_key_name = None
+                existing_history.server_key_content = None
+            elif auth_method == 'key' and encrypted_key_content:
+                existing_history.server_key = encrypted_key_content
+                existing_history.server_key_content = encrypted_key_content
+                existing_history.server_key_name = key_file_name or ''
+                existing_history.server_password = None
+            
+            existing_history.save()
+            logger.info(f"Updated connection history for user {user.username} - {username}@{ip_address}")
+        else:
+            # Create new record
+            history_data = {
+                'user': user,
+                'server_ip': ip_address,
+                'server_port': port,
+                'server_username': username,
+                'server_key_type': auth_method,
+                'last_connected': timezone.now(),
+            }
+            
+            if auth_method == 'password' and encrypted_password:
+                history_data['server_password'] = encrypted_password
+            elif auth_method == 'key' and encrypted_key_content:
+                history_data['server_key'] = encrypted_key_content
+                history_data['server_key_content'] = encrypted_key_content
+                history_data['server_key_name'] = key_file_name or ''
+            
+            ServerConnectionHistory.objects.create(**history_data)
+            logger.info(f"Created new connection history for user {user.username} - {username}@{ip_address}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error saving connection history: {str(e)}")
+        raise e
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def connect_from_history_view(request, history_id):
+    """
+    Connect to server using stored connection history credentials
+    Updates last_connected timestamp on successful connection
+    """
+    try:
+        if not request.user.is_authenticated:
+            logger.warning("Unauthenticated user attempted to connect from history")
+            return Response({
+                'success': False,
+                'message': 'Authentication required'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+        
+        try:
+            connection_history = ServerConnectionHistory.objects.get(
+                id=history_id,
+                user=request.user
+            )
+        except ServerConnectionHistory.DoesNotExist:
+            logger.warning(f"Connection history {history_id} not found for user {request.user.username}")
+            return Response({
+                'success': False,
+                'message': 'Connection history not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Check if connection is expired
+        if connection_history.is_expired():
+            logger.info(f"Connection history {history_id} is expired, deleting it")
+            connection_history.delete()
+            return Response({
+                'success': False,
+                'message': 'Connection history has expired (older than 7 days)'
+            }, status=status.HTTP_410_GONE)
+        
+        # Decrypt stored credentials
+        decrypted_password = None
+        decrypted_key_content = None
+        
+        if connection_history.server_key_type == 'password' and connection_history.server_password:
+            decrypted_password = decrypt_ssh_password(connection_history.server_password)
+            if not decrypted_password:
+                logger.error(f"Failed to decrypt password for connection history {history_id}")
+                return Response({
+                    'success': False,
+                    'message': 'Failed to decrypt stored credentials'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        elif connection_history.server_key_type == 'key' and connection_history.server_key_content:
+            decrypted_key_content = decrypt_ssh_password(connection_history.server_key_content)
+            if not decrypted_key_content:
+                logger.error(f"Failed to decrypt key for connection history {history_id}")
+                return Response({
+                    'success': False,
+                    'message': 'Failed to decrypt stored credentials'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        else:
+            logger.error(f"No valid credentials found for connection history {history_id}")
+            return Response({
+                'success': False,
+                'message': 'No valid credentials found in connection history'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Create connection config
+        connection_config = create_ssh_config(
+            connection_history.server_username,
+            str(connection_history.server_ip),
+            connection_history.server_key_type or 'password',
+            decrypted_password,
+            decrypted_key_content,
+            connection_history.server_key_name
+        )
+        
+        # Attempt connection
+        start_time = timezone.now()
+        conn = None
+        try:
+            conn = get_ssh_connection(connection_config)
+            
+            # Get OS type
+            os_type_command = "cat /etc/os-release 2>/dev/null | grep -E '^ID=' | cut -d'=' -f2 | tr -d '\"'"
+            stdin, stdout, stderr = conn.exec_command(os_type_command)
+            os_type = stdout.read().decode().strip()
+            
+            # Update last_connected timestamp
+            connection_history.last_connected = timezone.now()
+            connection_history.save()
+            
+            logger.info(f"Connected from history {history_id} in {(timezone.now() - start_time).total_seconds()}s for user {request.user.username}")
+            
+            return Response({
+                'success': True,
+                'osType': os_type,
+                'message': 'Connected successfully using stored credentials'
+            }, status=status.HTTP_200_OK)
+        
+        except paramiko.AuthenticationException:
+            logger.error(f"Authentication failed for connection history {history_id}")
+            return Response({
+                'success': False,
+                'message': 'Authentication failed. Stored credentials may be invalid.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+        except paramiko.SSHException as e:
+            logger.error(f"SSH connection error for history {history_id}: {str(e)}")
+            return Response({
+                'success': False,
+                'message': f'SSH connection error: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            logger.error(f"Connection error for history {history_id}: {str(e)}")
+            return Response({
+                'success': False,
+                'message': 'Failed to connect to server',
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    except Exception as e:
+        logger.error(f"Error connecting from history: {str(e)}")
+        return Response({
+            'success': False,
+            'message': 'Failed to connect from history',
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_connection_history_view(request):
+    """
+    Get connection history for authenticated user
+    Returns list of connections with last_connected time
+    """
+    try:
+        if not request.user.is_authenticated:
+            logger.warning("Unauthenticated user attempted to access connection history")
+            return Response({
+                'success': False,
+                'message': 'Authentication required'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+        
+        # Clean up expired connections first
+        cleanup_expired_connections(request.user)
+        
+        # Get all non-expired connections for the user
+        connections = ServerConnectionHistory.objects.filter(
+            user=request.user
+        ).order_by('-last_connected')
+        
+        # Filter out expired connections
+        from datetime import timedelta
+        seven_days_ago = timezone.now() - timedelta(days=7)
+        connections = connections.filter(last_connected__gte=seven_days_ago)
+        
+        history_list = []
+        for conn in connections:
+            history_list.append({
+                'id': conn.id,
+                'server_ip': str(conn.server_ip),
+                'server_port': conn.server_port,
+                'server_username': conn.server_username,
+                'auth_method': conn.server_key_type or 'password',
+                'last_connected': conn.last_connected.isoformat(),
+                'created_at': conn.created_at.isoformat(),
+            })
+        
+        logger.info(f"Retrieved {len(history_list)} connection history records for user {request.user.username}")
+        
+        return Response({
+            'success': True,
+            'count': len(history_list),
+            'connections': history_list
+        }, status=status.HTTP_200_OK)
+    
+    except Exception as e:
+        logger.error(f"Error retrieving connection history: {str(e)}")
+        return Response({
+            'success': False,
+            'message': 'Failed to retrieve connection history',
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_connection_history_view(request, history_id):
+    """
+    Delete a specific connection history by ID
+    Also deletes associated SSH key file if it exists
+    """
+    try:
+        if not request.user.is_authenticated:
+            logger.warning("Unauthenticated user attempted to delete connection history")
+            return Response({
+                'success': False,
+                'message': 'Authentication required'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+        
+        try:
+            connection_history = ServerConnectionHistory.objects.get(
+                id=history_id,
+                user=request.user
+            )
+        except ServerConnectionHistory.DoesNotExist:
+            logger.warning(f"Connection history {history_id} not found for user {request.user.username}")
+            return Response({
+                'success': False,
+                'message': 'Connection history not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Store info for logging before deletion
+        server_info = f"{connection_history.server_username}@{connection_history.server_ip}"
+        
+        # Delete associated key file if it exists
+        if connection_history.server_key_path:
+            try:
+                import os
+                if os.path.exists(connection_history.server_key_path):
+                    os.remove(connection_history.server_key_path)
+                    logger.info(f"Deleted SSH key file: {connection_history.server_key_path}")
+            except Exception as key_error:
+                logger.warning(f"Failed to delete key file {connection_history.server_key_path}: {str(key_error)}")
+        
+        # Delete the history record
+        connection_history.delete()
+        
+        logger.info(f"Deleted connection history {history_id} ({server_info}) for user {request.user.username}")
+        
+        return Response({
+            'success': True,
+            'message': 'Connection history deleted successfully'
+        }, status=status.HTTP_200_OK)
+    
+    except Exception as e:
+        logger.error(f"Error deleting connection history: {str(e)}")
+        return Response({
+            'success': False,
+            'message': 'Failed to delete connection history',
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@authentication_classes([CsrfExemptSessionAuthentication])
+def execute_command_view(request):
+    """
+    Command execution endpoint
+    Based on Node.js backend /api/execute-command endpoint
+    """
+    start_time = timezone.now()
+    conn = None
+    connection_key = None
+    
+    try:
+        username = request.data.get('username')
+        ip_address = request.data.get('ipAddress')
+        auth_method = request.data.get('authMethod')
+        command = request.data.get('command')
+        password = request.data.get('password')
+        key_file_content = request.data.get('keyFileContent')
+        key_file_name = request.data.get('keyFileName')
+        use_sudo = request.data.get('useSudo', False)
+        connection_key = get_connection_key(username, ip_address, auth_method)
+        
+        if not username or not ip_address or not command:
+            return Response({
+                'success': False,
+                'message': 'Missing required fields (username, IP address, or command)'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not auth_method or auth_method not in ['password', 'key']:
+            return Response({
+                'success': False,
+                'message': 'Invalid authentication method'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if auth_method == 'password' and not password:
+            return Response({
+                'success': False,
+                'message': 'Password is required for password authentication'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if auth_method == 'key' and not key_file_content:
+            return Response({
+                'success': False,
+                'message': 'Key file content is required for key authentication'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        decrypted_password = None
+        decrypted_key_content = None
+        
+        try:
+            if auth_method == 'password':
+                decrypted_password = decrypt_ssh_password(password)
+                if not decrypted_password:
+                    raise Exception('Failed to decrypt SSH password')
+            else:
+                decrypted_key_content = decrypt_ssh_password(key_file_content)
+                if not decrypted_key_content:
+                    raise Exception('Failed to decrypt SSH key file')
+        except Exception as decrypt_error:
+            return Response({
+                'success': False,
+                'message': str(decrypt_error)
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        connection_config = create_ssh_config(
+            username, ip_address, auth_method, decrypted_password, decrypted_key_content, key_file_name
+        )
+        
+        conn = get_ssh_connection(connection_config)
+        
+        output = execute_ssh_command(
+            conn, command,
+            use_sudo=use_sudo,
+            decrypted_password=decrypted_password,
+            auth_method=auth_method
+        )
+        
+        # Update connection pool last_used time
+        if connection_key in ssh_connection_pool:
+            ssh_connection_pool[connection_key]['last_used'] = time.time()
+        
+        logger.info(f"SSH execute command completed in {(timezone.now() - start_time).total_seconds()}s")
+        
+        return Response({
+            'success': True,
+            'output': output
+        }, status=status.HTTP_200_OK)
+    
+    except paramiko.AuthenticationException:
+        # Clean up connection on authentication failure
+        if connection_key and connection_key in ssh_connection_pool:
+            try:
+                ssh_connection_pool[connection_key]['client'].close()
+            except:
+                pass
+            del ssh_connection_pool[connection_key]
+        
+        return Response({
+            'success': False,
+            'message': 'Authentication failed. Please check your credentials.'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    except paramiko.SSHException as e:
+        # Clean up connection on SSH error
+        if connection_key and connection_key in ssh_connection_pool:
+            try:
+                ssh_connection_pool[connection_key]['client'].close()
+            except:
+                pass
+            del ssh_connection_pool[connection_key]
+        
+        if 'ETIMEDOUT' in str(e) or 'ECONNREFUSED' in str(e):
+            return Response({
+                'success': False,
+                'message': 'Connection timed out. Please verify the server address and try again.'
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        
+        return Response({
+            'success': False,
+            'message': f'SSH connection error: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        logger.error(f"SSH execute command error after {(timezone.now() - start_time).total_seconds()}s: {e}")
+        
+        # Clean up connection on error
+        if connection_key and connection_key in ssh_connection_pool:
+            try:
+                ssh_connection_pool[connection_key]['client'].close()
+            except:
+                pass
+            del ssh_connection_pool[connection_key]
+        
+        error_message = str(e)
+        if 'sudo' in error_message.lower():
+            return Response({
+                'success': False,
+                'message': 'Sudo access denied. Ensure you have the necessary privileges.'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        return Response({
+            'success': False,
+            'message': error_message or 'Failed to execute command',
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@authentication_classes([CsrfExemptSessionAuthentication])
+def execute_script_view(request):
+    """
+    Script execution endpoint
+    Based on Node.js backend /api/execute-script endpoint
+    """
+    start_time = timezone.now()
+    conn = None
+    connection_key = None
+    
+    try:
+        username = request.data.get('username')
+        ip_address = request.data.get('ipAddress')
+        auth_method = request.data.get('authMethod')
+        script_content = request.data.get('scriptContent')
+        password = request.data.get('password')
+        key_file_content = request.data.get('keyFileContent')
+        key_file_name = request.data.get('keyFileName')
+        use_sudo = request.data.get('useSudo', False)
+        connection_key = get_connection_key(username, ip_address, auth_method)
+        
+        if not username or not ip_address or not script_content:
+            return Response({
+                'success': False,
+                'message': 'Missing required fields (username, IP address, or script content)'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not auth_method or auth_method not in ['password', 'key']:
+            return Response({
+                'success': False,
+                'message': 'Invalid authentication method'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if auth_method == 'password' and not password:
+            return Response({
+                'success': False,
+                'message': 'Password is required for password authentication'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if auth_method == 'key' and not key_file_content:
+            return Response({
+                'success': False,
+                'message': 'Key file content is required for key authentication'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        decrypted_password = None
+        decrypted_key_content = None
+        
+        try:
+            if auth_method == 'password':
+                decrypted_password = decrypt_ssh_password(password)
+                if not decrypted_password:
+                    raise Exception('Failed to decrypt SSH password')
+            else:
+                decrypted_key_content = decrypt_ssh_password(key_file_content)
+                if not decrypted_key_content:
+                    raise Exception('Failed to decrypt SSH key file')
+        except Exception as decrypt_error:
+            return Response({
+                'success': False,
+                'message': str(decrypt_error)
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        connection_config = create_ssh_config(
+            username, ip_address, auth_method, decrypted_password, decrypted_key_content, key_file_name
+        )
+        
+        conn = get_ssh_connection(connection_config)
+        
+        output = upload_and_execute_script(
+            conn, script_content,
+            use_sudo=use_sudo,
+            decrypted_password=decrypted_password,
+            auth_method=auth_method
+        )
+        
+        # Update connection pool last_used time
+        if connection_key in ssh_connection_pool:
+            ssh_connection_pool[connection_key]['last_used'] = time.time()
+        
+        logger.info(f"SSH execute script completed in {(timezone.now() - start_time).total_seconds()}s")
+        
+        return Response({
+            'success': True,
+            'output': output
+        }, status=status.HTTP_200_OK)
+    
+    except paramiko.AuthenticationException:
+        # Clean up connection on authentication failure
+        if connection_key and connection_key in ssh_connection_pool:
+            try:
+                ssh_connection_pool[connection_key]['client'].close()
+            except:
+                pass
+            del ssh_connection_pool[connection_key]
+        
+        return Response({
+            'success': False,
+            'message': 'Authentication failed. Please check your credentials.'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    except paramiko.SSHException as e:
+        # Clean up connection on SSH error
+        if connection_key and connection_key in ssh_connection_pool:
+            try:
+                ssh_connection_pool[connection_key]['client'].close()
+            except:
+                pass
+            del ssh_connection_pool[connection_key]
+        
+        if 'ETIMEDOUT' in str(e) or 'ECONNREFUSED' in str(e):
+            return Response({
+                'success': False,
+                'message': 'Connection timed out. Please verify the server address and try again.'
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        
+        return Response({
+            'success': False,
+            'message': f'SSH connection error: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        logger.error(f"SSH execute script error after {(timezone.now() - start_time).total_seconds()}s: {e}")
+        
+        # Clean up connection on error
+        if connection_key and connection_key in ssh_connection_pool:
+            try:
+                ssh_connection_pool[connection_key]['client'].close()
+            except:
+                pass
+            del ssh_connection_pool[connection_key]
+        
+        error_message = str(e)
+        if 'sudo' in error_message.lower():
+            return Response({
+                'success': False,
+                'message': 'Sudo access denied. Ensure you have the necessary privileges.'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        return Response({
+            'success': False,
+            'message': error_message or 'Failed to execute script',
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+def cleanup_expired_connections(user=None):
+    """
+    Clean up connection history older than 7 days
+    Can be called for a specific user or all users
+    """
+    try:
+        from datetime import timedelta
+        seven_days_ago = timezone.now() - timedelta(days=7)
+        
+        if user:
+            expired_connections = ServerConnectionHistory.objects.filter(
+                user=user,
+                last_connected__lt=seven_days_ago
+            )
+        else:
+            expired_connections = ServerConnectionHistory.objects.filter(
+                last_connected__lt=seven_days_ago
+            )
+        
+        deleted_count = 0
+        for conn in expired_connections:
+            # Delete associated key file if it exists
+            if conn.server_key_path:
+                try:
+                    import os
+                    if os.path.exists(conn.server_key_path):
+                        os.remove(conn.server_key_path)
+                        logger.info(f"Deleted expired SSH key file: {conn.server_key_path}")
+                except Exception as key_error:
+                    logger.warning(f"Failed to delete key file {conn.server_key_path}: {str(key_error)}")
+            
+            conn.delete()
+            deleted_count += 1
+        
+        if deleted_count > 0:
+            logger.info(f"Cleaned up {deleted_count} expired connection history records")
+        
+        return deleted_count
+    
+    except Exception as e:
+        logger.error(f"Error cleaning up expired connections: {str(e)}")
+        return 0
