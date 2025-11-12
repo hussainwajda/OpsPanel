@@ -61,3 +61,36 @@ class CustomUser(AbstractUser):
         """Format date like Node.js backend"""
         from django.utils import timezone
         return timezone.now().strftime('%d-%b-%Y %H:%M:%S')
+
+
+class ServerConnectionHistory(models.Model):
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE)
+    server_ip = models.GenericIPAddressField()
+    server_port = models.IntegerField(default=22)
+    server_username = models.CharField(max_length=50)
+    server_password = models.TextField(blank=True, null=True, help_text="Encrypted password")
+    server_key = models.TextField(blank=True, null=True, help_text="Encrypted key file content")
+    server_key_name = models.CharField(max_length=255, blank=True, null=True)
+    server_key_type = models.CharField(max_length=50, blank=True, null=True, help_text="password or key")
+    server_key_path = models.CharField(max_length=255, blank=True, null=True)
+    server_key_content = models.TextField(blank=True, null=True, help_text="Encrypted key content")
+    last_connected = models.DateTimeField(default=timezone.now, help_text="Last connection timestamp")
+    created_at = models.DateTimeField(auto_now_add=True, help_text="Record creation timestamp")
+    
+    class Meta:
+        db_table = 'server_connection_history'
+        verbose_name = 'Server Connection History'
+        verbose_name_plural = 'Server Connection Histories'
+        ordering = ['-last_connected']
+        indexes = [
+            models.Index(fields=['user', '-last_connected']),
+            models.Index(fields=['-last_connected']),
+        ]
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.server_username}@{self.server_ip}:{self.server_port}"
+    
+    def is_expired(self):
+        """Check if connection history is older than 7 days"""
+        from datetime import timedelta
+        return timezone.now() - self.last_connected > timedelta(days=7)
