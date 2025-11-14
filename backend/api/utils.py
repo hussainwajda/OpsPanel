@@ -190,3 +190,83 @@ def cleanup_ssh_connections():
             del ssh_connection_pool[key]
     if closed_count > 0:
         print(f"Connection pool cleanup: closed {closed_count} inactive connections")
+
+def execute_ssh_command(client, command, use_sudo=False, decrypted_password=None, auth_method='password', return_code=False, ignore_error=False):
+    """
+    Execute a command via SSH connection
+    Based on Node.js backend createExecPromise function
+    """
+    try:
+        if use_sudo and auth_method == 'password' and decrypted_password:
+            final_command = f'echo "{decrypted_password}" | sudo -S {command}'
+        elif use_sudo and auth_method == 'key':
+            final_command = f'sudo {command}'
+        elif 'sudo' in command and auth_method == 'password' and decrypted_password:
+            final_command = command.replace('sudo', f'echo "{decrypted_password}" | sudo -S')
+        else:
+            final_command = command
+        
+        stdin, stdout, stderr = client.exec_command(final_command)
+        exit_status = stdout.channel.recv_exit_status()
+        output = stdout.read().decode('utf-8')
+        error_output = stderr.read().decode('utf-8')
+        
+        if return_code:
+            return {'output': output, 'code': exit_status}
+        elif exit_status != 0 and not ignore_error:
+            raise Exception(f'Command exited with code {exit_status}: {error_output or "Unknown error"}')
+        else:
+            return output
+    except Exception as e:
+        raise e
+
+def upload_and_execute_script(client, script_content, use_sudo=False, decrypted_password=None, auth_method='password'):
+    """
+    Upload a script to the remote server and execute it
+    Based on Node.js backend execute-script endpoint
+    """
+    import random
+    timestamp = int(time.time() * 1000)
+    script_filename = f'/tmp/custom_script_{timestamp}_{random.randint(1000, 9999)}.sh'
+    
+    try:
+        # Upload script using SFTP
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(script_filename, 'w') as f:
+                f.write(script_content)
+            sftp.chmod(script_filename, 0o755)
+        finally:
+            sftp.close()
+        
+        # Execute the script
+        if use_sudo:
+            if auth_method == 'password' and decrypted_password:
+                command = f'echo "{decrypted_password}" | sudo -S {script_filename}'
+            else:
+                command = f'sudo {script_filename}'
+        else:
+            command = script_filename
+        
+        stdin, stdout, stderr = client.exec_command(command)
+        exit_status = stdout.channel.recv_exit_status()
+        output = stdout.read().decode('utf-8')
+        error_output = stderr.read().decode('utf-8')
+        
+        # Clean up script file
+        try:
+            client.exec_command(f'rm -f {script_filename}')
+        except:
+            pass
+        
+        if exit_status != 0:
+            raise Exception(f'Script execution failed: {error_output or "Unknown error"}')
+        
+        return output
+    except Exception as e:
+        # Try to clean up script file even on error
+        try:
+            client.exec_command(f'rm -f {script_filename}')
+        except:
+            pass
+        raise e
