@@ -39,7 +39,7 @@ const authApi = async (payload) => {
     console.log("Token: ", token);
     console.log("Public Ip: ",publicIP)
     const response = await fetch(
-      `${import.meta.env.VITE_API_BASE_URL}/api/auth/,
+      `${import.meta.env.VITE_API_BASE_URL}/api/auth/`,
       {
         method: "POST",
         headers: {
@@ -48,7 +48,7 @@ const authApi = async (payload) => {
           "X-Public-IP": publicIP || "Unknown",
         },
         body: JSON.stringify(payload),
-      }`
+      }
     );
 
     if (!response.ok) {
@@ -202,7 +202,7 @@ const Auth = () => {
     const value = formData[getCurrentInputName()];
     
     if (!value) {
-      toast.error(`${getCurrentLabel()} is required, { id: ${getCurrentLabel()}-required }`);
+      toast.error(`${getCurrentLabel()} is required`, { id: `${getCurrentLabel()}-required` });
       return false;
     }
 
@@ -326,6 +326,11 @@ const Auth = () => {
         setCookie('userEmail', response.email, cookieOptions);
         setCookie('username', response.username, cookieOptions);
         setCookie('deviceToken', token, cookieOptions);
+        
+        // Store auth token if provided by backend
+        if (response.token) {
+          setCookie('authToken', response.token, cookieOptions);
+        }
         
         toast.success('Successfully signed in!', { id: 'signin-success' });
         console.log('Authentication response:', response);
@@ -458,4 +463,4 @@ const Auth = () => {
   );
 };
 
-export default Auth;
+export default Auth;
