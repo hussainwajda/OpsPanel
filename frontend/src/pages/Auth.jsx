@@ -36,9 +36,10 @@ const authApi = async (payload) => {
 
     // Retrieve public IP
     const publicIP = await getPublicIP();
-
+    console.log("Token: ", token);
+    console.log("Public Ip: ",publicIP)
     const response = await fetch(
-      `${import.meta.env.VITE_API_BASE_URL}/api/auth/`,
+      `${import.meta.env.VITE_API_BASE_URL}/api/auth/,
       {
         method: "POST",
         headers: {
@@ -47,7 +48,7 @@ const authApi = async (payload) => {
           "X-Public-IP": publicIP || "Unknown",
         },
         body: JSON.stringify(payload),
-      }
+      }`
     );
 
     if (!response.ok) {
@@ -201,7 +202,7 @@ const Auth = () => {
     const value = formData[getCurrentInputName()];
     
     if (!value) {
-      toast.error(`${getCurrentLabel()} is required`, { id: `${getCurrentLabel()}-required` });
+      toast.error(`${getCurrentLabel()} is required, { id: ${getCurrentLabel()}-required }`);
       return false;
     }
 
@@ -273,23 +274,32 @@ const Auth = () => {
   // Submit authentication request
   const handleSubmit = async () => {
     try {
+      // Encrypt password
+      const encryptedPassword = encryptPassword(formData.password);
+      
+      if (!encryptedPassword) {
+        console.error('Password encryption failed');
+        return;
+      }
+  
       // Generate device token
       const token = await generateToken();
   
-      // Prepare authentication payload (using plain password temporarily)
+      // Prepare authentication payload
       const payload = isSignin 
         ? {
             auth: 'signin',
             email: formData.email.toLowerCase(),
-            password: formData.password  // Plain password for now
+            password: formData.password
           }
         : {
             auth: 'signup',
             username: formData.username,
             email: formData.email.toLowerCase(),
-            password: formData.password  // Plain password for now
+            password: encryptedPassword
           };
   
+      console.log('Authentication payload:', payload);
       // Send authentication request
       const response = await authApi(payload);
       
@@ -448,4 +458,4 @@ const Auth = () => {
   );
 };
 
-export default Auth;
+export default Auth;
