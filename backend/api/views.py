@@ -52,10 +52,6 @@ def health_check(request):
 @permission_classes([AllowAny])
 @authentication_classes([CsrfExemptSessionAuthentication])
 def auth_view(request):
-    """
-    Combined authentication endpoint for signup and signin
-    Based on Node.js backend /api/auth endpoint
-    """
     logger.info(f"Auth request received: {request.method} {request.path}")
     logger.info(f"Request headers: {dict(request.headers)}")
     logger.info(f"Request data: {request.data}")
@@ -175,10 +171,6 @@ def auth_view(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def validate_auth_view(request):
-    """
-    Authentication validation endpoint
-    Based on Node.js backend /api/validate-auth endpoint
-    """
     try:
         email = request.data.get('email')
         username = request.data.get('username')
@@ -442,10 +434,6 @@ def delete_user_view(request):
 @permission_classes([AllowAny])
 @authentication_classes([CsrfExemptSessionAuthentication])
 def check_installed_view(request):
-    """
-    Check installed applications endpoint
-    Based on Node.js backend /api/check-installed endpoint
-    """
     start_time = timezone.now()
     conn = None
     
@@ -567,10 +555,6 @@ def check_installed_view(request):
 @permission_classes([AllowAny])
 @authentication_classes([CsrfExemptSessionAuthentication])
 def install_view(request):
-    """
-    Application installation endpoint
-    Based on Node.js backend /api/install endpoint
-    """
     import os
     start_time = timezone.now()
     conn = None
@@ -1159,7 +1143,6 @@ def delete_connection_history_view(request, history_id):
 def execute_command_view(request):
     """
     Command execution endpoint
-    Based on Node.js backend /api/execute-command endpoint
     """
     start_time = timezone.now()
     conn = None
@@ -1305,7 +1288,6 @@ def execute_command_view(request):
 def execute_script_view(request):
     """
     Script execution endpoint
-    Based on Node.js backend /api/execute-script endpoint
     """
     start_time = timezone.now()
     conn = None
@@ -1441,6 +1423,244 @@ def execute_script_view(request):
         return Response({
             'success': False,
             'message': error_message or 'Failed to execute script',
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@authentication_classes([CsrfExemptSessionAuthentication])
+def monitor_view(request):
+    """
+    SSH monitoring endpoint
+    """
+    start_time = timezone.now()
+    conn = None
+    connection_key = None
+    
+    try:
+        username = request.data.get('username')
+        ip_address = request.data.get('ipAddress')
+        auth_method = request.data.get('authMethod')
+        password = request.data.get('password')
+        key_file_content = request.data.get('keyFileContent')
+        key_file_name = request.data.get('keyFileName')
+        connection_key = get_connection_key(username, ip_address, auth_method)
+        
+        if not username or not ip_address:
+            return Response({
+                'success': False,
+                'message': 'Missing SSH connection details (username or IP address)'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not auth_method or auth_method not in ['password', 'key']:
+            return Response({
+                'success': False,
+                'message': 'Invalid authentication method'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if auth_method == 'password' and not password:
+            return Response({
+                'success': False,
+                'message': 'Password is required for password authentication'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if auth_method == 'key' and not key_file_content:
+            return Response({
+                'success': False,
+                'message': 'Key file content is required for key authentication'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        decrypted_password = None
+        decrypted_key_content = None
+        
+        if auth_method == 'password':
+            decrypted_password = decrypt_ssh_password(password)
+            if not decrypted_password:
+                return Response({
+                    'success': False,
+                    'message': 'Failed to decrypt SSH password'
+                }, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            decrypted_key_content = decrypt_ssh_password(key_file_content)
+            if not decrypted_key_content:
+                return Response({
+                    'success': False,
+                    'message': 'Failed to decrypt SSH key file'
+                }, status=status.HTTP_400_BAD_REQUEST)
+        
+        connection_config = create_ssh_config(
+            username, ip_address, auth_method, decrypted_password, decrypted_key_content, key_file_name
+        )
+        
+        conn = get_ssh_connection(connection_config)
+        
+        # Define monitoring commands
+        cpu_info_command = "cat /proc/cpuinfo | grep 'model name' | head -1 && top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}'"
+        memory_info_command = "free -h | grep 'Mem:' | awk '{print $2, $3}'"
+        processes_command = "ps aux | awk '{print $2, $1, $3, $4, $11}'"
+        load_command = "uptime | awk -F'load average:' '{print $2}'"
+        
+        # Execute commands in parallel using ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        def execute_command(cmd):
+            try:
+                return execute_ssh_command(
+                    conn, cmd,
+                    decrypted_password=decrypted_password,
+                    auth_method=auth_method,
+                    ignore_error=True
+                )
+            except Exception as e:
+                logger.error(f"Error executing command '{cmd}': {str(e)}")
+                return ""
+        
+        # Execute all commands in parallel
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_command = {
+                executor.submit(execute_command, cpu_info_command): 'cpu',
+                executor.submit(execute_command, memory_info_command): 'memory',
+                executor.submit(execute_command, processes_command): 'processes',
+                executor.submit(execute_command, load_command): 'load'
+            }
+            
+            results = {}
+            for future in as_completed(future_to_command):
+                command_type = future_to_command[future]
+                try:
+                    results[command_type] = future.result()
+                except Exception as e:
+                    logger.error(f"Error getting result for {command_type}: {str(e)}")
+                    results[command_type] = ""
+        
+        # Parse CPU info
+        cpu_info = results.get('cpu', '').strip()
+        cpu_lines = [line.strip() for line in cpu_info.split('\n') if line.strip()]
+        
+        # Extract CPU model (first line that contains 'model name' or first line)
+        cpu_model = ''
+        for line in cpu_lines:
+            if 'model name' in line.lower():
+                cpu_model = line.replace('model name\t: ', '').replace('model name : ', '').strip()
+                break
+        
+        # If no model found, use first line
+        if not cpu_model and cpu_lines:
+            cpu_model = cpu_lines[0]
+        
+        # Extract CPU usage (last numeric line, or line that looks like a percentage)
+        cpu_usage = 0.0
+        for line in reversed(cpu_lines):
+            # Try to parse as float
+            try:
+                # Remove any % signs or other characters
+                cleaned = line.replace('%', '').strip()
+                cpu_usage = float(cleaned)
+                break
+            except (ValueError, TypeError):
+                continue
+        
+        # Parse memory info
+        memory_info = results.get('memory', '').strip()
+        memory_parts = memory_info.split()
+        total_memory = memory_parts[0] if len(memory_parts) > 0 else '0'
+        used_memory = memory_parts[1] if len(memory_parts) > 1 else '0'
+        
+        # Parse processes
+        processes_output = results.get('processes', '').strip()
+        processes = []
+        process_lines = processes_output.split('\n')
+        for line in process_lines[1:]:  # Skip header line
+            parts = line.split(None, 4)  # Split into max 5 parts
+            if len(parts) >= 5:
+                processes.append({
+                    'pid': parts[0],
+                    'user': parts[1],
+                    'cpu': parts[2],
+                    'memory': parts[3],
+                    'command': parts[4]
+                })
+        
+        # Parse system load
+        system_load = results.get('load', '').strip()
+        load_parts = [part.strip() for part in system_load.split(',')]
+        load_1m = load_parts[0] if len(load_parts) > 0 else '0.00'
+        load_5m = load_parts[1] if len(load_parts) > 1 else '0.00'
+        load_15m = load_parts[2] if len(load_parts) > 2 else '0.00'
+        
+        # Update connection pool last_used time
+        if connection_key in ssh_connection_pool:
+            ssh_connection_pool[connection_key]['last_used'] = time.time()
+        
+        logger.info(f"SSH monitoring completed in {(timezone.now() - start_time).total_seconds()}s")
+        
+        return Response({
+            'success': True,
+            'cpuInfo': {
+                'model': cpu_model,
+                'usage': f"{cpu_usage:.2f}"
+            },
+            'memoryInfo': {
+                'total': total_memory,
+                'used': used_memory
+            },
+            'processes': processes,
+            'systemLoad': {
+                '1m': load_1m,
+                '5m': load_5m,
+                '15m': load_15m
+            }
+        }, status=status.HTTP_200_OK)
+    
+    except paramiko.AuthenticationException:
+        # Clean up connection on authentication failure
+        if connection_key and connection_key in ssh_connection_pool:
+            try:
+                ssh_connection_pool[connection_key]['client'].close()
+            except:
+                pass
+            del ssh_connection_pool[connection_key]
+        
+        return Response({
+            'success': False,
+            'message': 'Authentication failed. Please check your credentials.'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    except paramiko.SSHException as e:
+        # Clean up connection on SSH error
+        if connection_key and connection_key in ssh_connection_pool:
+            try:
+                ssh_connection_pool[connection_key]['client'].close()
+            except:
+                pass
+            del ssh_connection_pool[connection_key]
+        
+        error_str = str(e)
+        if 'ETIMEDOUT' in error_str or 'ECONNREFUSED' in error_str:
+            return Response({
+                'success': False,
+                'message': 'Connection timed out. Please verify the server address and try again.'
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        
+        return Response({
+            'success': False,
+            'message': 'Failed to retrieve monitoring data',
+            'error': error_str
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as e:
+        logger.error(f"SSH monitoring error after {(timezone.now() - start_time).total_seconds()}s: {e}")
+        
+        # Clean up connection on error
+        if connection_key and connection_key in ssh_connection_pool:
+            try:
+                ssh_connection_pool[connection_key]['client'].close()
+            except:
+                pass
+            del ssh_connection_pool[connection_key]
+        
+        return Response({
+            'success': False,
+            'message': 'Failed to retrieve monitoring data',
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
