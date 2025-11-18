@@ -327,6 +327,11 @@ const Auth = () => {
         setCookie('username', response.username, cookieOptions);
         setCookie('deviceToken', token, cookieOptions);
         
+        // Store auth token if provided by backend
+        if (response.token) {
+          setCookie('authToken', response.token, cookieOptions);
+        }
+        
         toast.success('Successfully signed in!', { id: 'signin-success' });
         console.log('Authentication response:', response);
         localStorage.setItem('activeTab', 'Server Configuration')
