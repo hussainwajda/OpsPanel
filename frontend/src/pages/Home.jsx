@@ -8,7 +8,6 @@ import {
 import ToastContainer from '../components/ToastContainer.jsx';
 import SSHConnectionCard from '../components/dashboard/SSHConnectionCard.jsx';
 import AppInstall from '../components/dashboard/AppInstall.jsx';
-import Monitoring from '../components/dashboard/Monitoring.jsx';
 import FileExplorer from '../components/dashboard/FileExplorer.jsx';
 import CustomCommands from '../components/dashboard/CustomCommands.jsx';
 import toast from 'react-hot-toast';
