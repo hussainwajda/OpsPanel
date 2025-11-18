@@ -150,7 +150,7 @@ const NavBar = ({ isAuthenticated }) => {
             >
               <Menu className="h-6 w-6" />
             </button>
-            <span className="text-white block font-bold text-2xl">ServerMaster</span>
+            <span className="text-white block font-bold text-2xl">OpsPanel</span>
           </div>
 
           {/* User Menu */}
